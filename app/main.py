@@ -75,7 +75,7 @@ PREVIEW_DEFAULT_FPS = max(1, min(60, int(os.getenv("PREVIEW_MJPEG_FPS", "20"))))
 PREVIEW_DEFAULT_SCALE = os.getenv("PREVIEW_MJPEG_SCALE", "640:-1").strip() or "640:-1"
 PREVIEW_DEFAULT_QV = max(2, min(31, int(os.getenv("PREVIEW_MJPEG_Q", "8"))))
 PREVIEW_LOW_LATENCY = os.getenv("PREVIEW_MJPEG_LOW_LATENCY", "1").strip() not in {"0", "false", "False"}
-PTZ_MIN_APPLY_INTERVAL_SECONDS = max(0.1, float(os.getenv("RUNNER_PTZ_MIN_APPLY_INTERVAL_SECONDS", "0.35")))
+PTZ_MIN_APPLY_INTERVAL_SECONDS = max(0.1, float(os.getenv("RUNNER_PTZ_MIN_APPLY_INTERVAL_SECONDS", "1.0")))
 PTZ_MIN_DELTA_XY = max(0.0, float(os.getenv("RUNNER_PTZ_MIN_DELTA_XY", "0.008")))
 PTZ_MIN_DELTA_ZOOM = max(0.0, float(os.getenv("RUNNER_PTZ_MIN_DELTA_ZOOM", "0.015")))
 
