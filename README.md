@@ -20,10 +20,18 @@ RUNNER_API_KEY=tokenA RUNNER_PUBLIC_BASE_URL=http://10.0.1.10:9001 uvicorn app.m
 - `RUNNER_PTZ_MIN_APPLY_INTERVAL_SECONDS` (default `0.35`) cooldown anti-jitter PTZ
 - `RUNNER_PTZ_MIN_DELTA_XY` (default `0.008`) delta minimo center X/Y per riapplicare crop
 - `RUNNER_PTZ_MIN_DELTA_ZOOM` (default `0.015`) delta minimo zoom per riapplicare crop
+- `RUNNER_PTZ_HOT_UPDATE_ENABLED` (default `1`) abilita PTZ hot-update via `ffmpeg zmq` (se disponibile)
+- `RUNNER_PTZ_HOT_UPDATE_TIMEOUT_MS` (default `350`) timeout comando ZMQ
+- `RUNNER_PTZ_RESTART_MIN_INTERVAL_SECONDS` (default `1.15`) fallback restart throttled quando hot-update fallisce
+- `RUNNER_PTZ_WORKER_POLL_SECONDS` (default `0.08`) polling worker PTZ
 
 ## Stato attuale
 
 L'agent avvia processi FFmpeg reali per preview e ingest, espone stato job e stop con terminate/kill.
+
+PTZ update:
+- percorso primario: hot-update runtime su filtro `crop` tramite `zmq` (senza restart ffmpeg)
+- fallback automatico: restart ingest con throttling se ZMQ non disponibile o comando fallisce
 
 Endpoint principali:
 

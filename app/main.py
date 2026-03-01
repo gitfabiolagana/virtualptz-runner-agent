@@ -6,6 +6,7 @@ import threading
 import math
 import random
 import time
+import socket
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -13,6 +14,11 @@ from uuid import uuid4
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+try:
+    import zmq  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001
+    zmq = None
 
 JPEG_SOI = b"\xff\xd8"
 JPEG_EOI = b"\xff\xd9"
@@ -58,6 +64,18 @@ class TrackingUpdateRequest(BaseModel):
     fallback_active: bool = False
     occlusion_level: float = Field(default=0.0, ge=0.0, le=1.0)
     source: str = Field(default="external", min_length=2, max_length=32)
+    tracking_mode_hint: str | None = Field(
+        default=None,
+        pattern="^(follow_play|follow_ball|half_court_lock|fast_break|reacquire)$",
+    )
+    play_phase: str | None = Field(
+        default=None,
+        pattern="^(set_offense|transition|rebound|deadball|free_throw)$",
+    )
+    ball_velocity_x: float | None = None
+    ball_velocity_y: float | None = None
+    possession_side: str | None = Field(default=None, pattern="^(left|right|unknown)$")
+    court_homography_ok: bool | None = None
 
 
 class PtzUpdateRequest(BaseModel):
@@ -75,9 +93,17 @@ PREVIEW_DEFAULT_FPS = max(1, min(60, int(os.getenv("PREVIEW_MJPEG_FPS", "20"))))
 PREVIEW_DEFAULT_SCALE = os.getenv("PREVIEW_MJPEG_SCALE", "640:-1").strip() or "640:-1"
 PREVIEW_DEFAULT_QV = max(2, min(31, int(os.getenv("PREVIEW_MJPEG_Q", "8"))))
 PREVIEW_LOW_LATENCY = os.getenv("PREVIEW_MJPEG_LOW_LATENCY", "1").strip() not in {"0", "false", "False"}
-PTZ_MIN_APPLY_INTERVAL_SECONDS = max(0.1, float(os.getenv("RUNNER_PTZ_MIN_APPLY_INTERVAL_SECONDS", "1.0")))
-PTZ_MIN_DELTA_XY = max(0.0, float(os.getenv("RUNNER_PTZ_MIN_DELTA_XY", "0.008")))
-PTZ_MIN_DELTA_ZOOM = max(0.0, float(os.getenv("RUNNER_PTZ_MIN_DELTA_ZOOM", "0.015")))
+PTZ_MIN_APPLY_INTERVAL_SECONDS = max(0.1, float(os.getenv("RUNNER_PTZ_MIN_APPLY_INTERVAL_SECONDS", "0.25")))
+PTZ_MIN_DELTA_XY = max(0.0, float(os.getenv("RUNNER_PTZ_MIN_DELTA_XY", "0.004")))
+PTZ_MIN_DELTA_ZOOM = max(0.0, float(os.getenv("RUNNER_PTZ_MIN_DELTA_ZOOM", "0.010")))
+PTZ_RESTART_MIN_INTERVAL_SECONDS = max(
+    PTZ_MIN_APPLY_INTERVAL_SECONDS,
+    float(os.getenv("RUNNER_PTZ_RESTART_MIN_INTERVAL_SECONDS", "1.15")),
+)
+PTZ_WORKER_POLL_SECONDS = max(0.05, float(os.getenv("RUNNER_PTZ_WORKER_POLL_SECONDS", "0.08")))
+PTZ_HOT_UPDATE_ENABLED = os.getenv("RUNNER_PTZ_HOT_UPDATE_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+PTZ_HOT_UPDATE_TIMEOUT_MS = max(100, int(os.getenv("RUNNER_PTZ_HOT_UPDATE_TIMEOUT_MS", "350")))
+PTZ_FILTER_INSTANCE_NAME = "ptz"
 
 preview_jobs: dict[str, dict] = {}
 ingest_jobs: dict[str, dict] = {}
@@ -185,11 +211,67 @@ def _ptz_filter(center_x: float, center_y: float, zoom: float) -> str:
     cx = _clamp(center_x, 0.0, 1.0)
     cy = _clamp(center_y, 0.0, 1.0)
     if z <= 1.01:
-        return "scale=1280:720"
-    return f"crop=w=iw/{z:.4f}:h=ih/{z:.4f}:x=(iw-iw/{z:.4f})*{cx:.4f}:y=(ih-ih/{z:.4f})*{cy:.4f},scale=1280:720"
+        w_expr = "iw"
+        h_expr = "ih"
+    else:
+        w_expr = f"iw/{z:.4f}"
+        h_expr = f"ih/{z:.4f}"
+    x_expr = f"(iw-{w_expr})*{cx:.4f}"
+    y_expr = f"(ih-{h_expr})*{cy:.4f}"
+    return f"crop=w={w_expr}:h={h_expr}:x={x_expr}:y={y_expr},scale=1280:720"
 
 
-def _ffmpeg_ingest_cmd(source_uri: str, profile: str, ptz: dict[str, float] | None = None) -> list[str]:
+def _ptz_hot_crop_filter(center_x: float, center_y: float, zoom: float) -> str:
+    z = _clamp(zoom, 1.0, 4.0)
+    cx = _clamp(center_x, 0.0, 1.0)
+    cy = _clamp(center_y, 0.0, 1.0)
+    if z <= 1.01:
+        w_expr = "iw"
+        h_expr = "ih"
+    else:
+        w_expr = f"iw/{z:.4f}"
+        h_expr = f"ih/{z:.4f}"
+    x_expr = f"(iw-{w_expr})*{cx:.4f}"
+    y_expr = f"(ih-{h_expr})*{cy:.4f}"
+    return f"crop@{PTZ_FILTER_INSTANCE_NAME}=w={w_expr}:h={h_expr}:x={x_expr}:y={y_expr},scale=1280:720"
+
+
+def _ptz_hot_commands(center_x: float, center_y: float, zoom: float) -> list[tuple[str, str]]:
+    z = _clamp(zoom, 1.0, 4.0)
+    cx = _clamp(center_x, 0.0, 1.0)
+    cy = _clamp(center_y, 0.0, 1.0)
+    if z <= 1.01:
+        w_expr = "iw"
+        h_expr = "ih"
+    else:
+        w_expr = f"iw/{z:.4f}"
+        h_expr = f"ih/{z:.4f}"
+    x_expr = f"(iw-{w_expr})*{cx:.4f}"
+    y_expr = f"(ih-{h_expr})*{cy:.4f}"
+    return [("w", w_expr), ("h", h_expr), ("x", x_expr), ("y", y_expr)]
+
+
+def _escape_filter_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace(":", "\\:")
+
+
+def _allocate_local_tcp_endpoint() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        port = int(sock.getsockname()[1])
+    finally:
+        sock.close()
+    return f"tcp://127.0.0.1:{port}"
+
+
+def _ffmpeg_ingest_cmd(
+    source_uri: str,
+    profile: str,
+    ptz: dict[str, float] | None = None,
+    ptz_command_endpoint: str | None = None,
+) -> list[str]:
     # Profile-specific transcode defaults; can be evolved per production policy.
     preset = {
         "quality": ["-preset", "slow", "-crf", "20"],
@@ -203,11 +285,14 @@ def _ffmpeg_ingest_cmd(source_uri: str, profile: str, ptz: dict[str, float] | No
     elif source_uri.startswith("rtmp://"):
         cmd.extend(["-rw_timeout", "15000000"])
     ptz_cfg = ptz or {}
-    vf = _ptz_filter(
-        float(ptz_cfg.get("center_x", 0.5)),
-        float(ptz_cfg.get("center_y", 0.5)),
-        float(ptz_cfg.get("zoom", 1.0)),
-    )
+    ptz_x = float(ptz_cfg.get("center_x", 0.5))
+    ptz_y = float(ptz_cfg.get("center_y", 0.5))
+    ptz_zoom = float(ptz_cfg.get("zoom", 1.0))
+    if ptz_command_endpoint:
+        escaped = _escape_filter_value(ptz_command_endpoint)
+        vf = f"zmq=bind_address={escaped},{_ptz_hot_crop_filter(ptz_x, ptz_y, ptz_zoom)}"
+    else:
+        vf = _ptz_filter(ptz_x, ptz_y, ptz_zoom)
     cmd.extend(["-i", source_uri, "-an", "-vf", vf, "-c:v", "libx264", *preset])
 
     if INGEST_OUTPUT_URI:
@@ -251,6 +336,12 @@ def _init_tracking_state(profile: str) -> dict:
         "fallback_active": False,
         "occlusion_level": 0.0,
         "source": "runner-sim",
+        "tracking_mode_hint": None,
+        "play_phase": None,
+        "ball_velocity_x": None,
+        "ball_velocity_y": None,
+        "possession_side": None,
+        "court_homography_ok": None,
         "updated_at": datetime.utcnow().isoformat(),
     }
 
@@ -303,6 +394,148 @@ def _start_ingest_watcher(job_id: str, proc: subprocess.Popen) -> None:
             job["updated_at"] = datetime.utcnow().isoformat()
 
     t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+
+
+def _apply_ptz_hot_update(command_endpoint: str, ptz_state: dict[str, float]) -> tuple[bool, str | None]:
+    if zmq is None:
+        return False, "pyzmq_not_available"
+    context = zmq.Context.instance()
+    sock = context.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, PTZ_HOT_UPDATE_TIMEOUT_MS)
+    sock.setsockopt(zmq.SNDTIMEO, PTZ_HOT_UPDATE_TIMEOUT_MS)
+    sock.setsockopt(zmq.LINGER, 0)
+    try:
+        sock.connect(command_endpoint)
+        for key, value in _ptz_hot_commands(
+            float(ptz_state.get("center_x", 0.5)),
+            float(ptz_state.get("center_y", 0.5)),
+            float(ptz_state.get("zoom", 1.0)),
+        ):
+            payload = f"{PTZ_FILTER_INSTANCE_NAME} {key} {value}"
+            sock.send_string(payload)
+            reply = sock.recv()
+            if not reply or not str(reply.decode("utf-8", errors="ignore")).strip().startswith("0"):
+                return False, "zmq_rejected_command"
+        return True, None
+    except Exception:  # noqa: BLE001
+        return False, "zmq_command_failed"
+    finally:
+        sock.close()
+
+
+def _restart_ingest_with_ptz(job_id: str, ptz_state: dict[str, float]) -> tuple[bool, str | None]:
+    with state_lock:
+        job = ingest_jobs.get(job_id)
+        if not job:
+            return False, "ingest job not found"
+        if job.get("state") != "running":
+            return False, "ingest job not running"
+        source_uri_ref = str(job.get("source_uri_ref", "")).strip()
+        profile = str(job.get("profile", "balanced"))
+        ptz_hot_enabled = bool(job.get("ptz_hot_update_enabled", False))
+        new_endpoint = _allocate_local_tcp_endpoint() if ptz_hot_enabled else None
+        if not source_uri_ref:
+            return False, "ingest job missing source_uri_ref"
+
+    cmd = _ffmpeg_ingest_cmd(source_uri_ref, profile, ptz=ptz_state, ptz_command_endpoint=new_endpoint)
+    try:
+        new_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError:
+        return False, "failed to restart ffmpeg for ptz update"
+
+    old_to_kill: subprocess.Popen | None = None
+    with state_lock:
+        job = ingest_jobs.get(job_id)
+        if not job or job.get("state") != "running":
+            _kill_process(new_proc)
+            return False, "ingest job stopped during ptz apply"
+        old_to_kill = job.get("proc")
+        job["proc"] = new_proc
+        job["pid"] = new_proc.pid
+        job["ptz"] = ptz_state
+        job["last_ptz_apply_ts"] = time.monotonic()
+        job["ptz_restart_count"] = int(job.get("ptz_restart_count", 0)) + 1
+        job["ptz_command_endpoint"] = new_endpoint
+        job["last_error"] = None
+        job["updated_at"] = datetime.utcnow().isoformat()
+
+    if old_to_kill is not None and old_to_kill is not new_proc:
+        _kill_process(old_to_kill)
+    _start_ingest_watcher(job_id, new_proc)
+    return True, None
+
+
+def _start_ptz_worker(job_id: str) -> None:
+    def _worker() -> None:
+        while True:
+            target: dict[str, float] | None = None
+            with state_lock:
+                job = ingest_jobs.get(job_id)
+                if not job:
+                    return
+                if job.get("state") != "running":
+                    job["ptz_worker_running"] = False
+                    return
+                pending = job.get("ptz_pending")
+                if pending and isinstance(pending, dict):
+                    last_applied = float(job.get("last_ptz_apply_ts", 0.0))
+                    if (time.monotonic() - last_applied) >= PTZ_RESTART_MIN_INTERVAL_SECONDS:
+                        target = dict(pending)
+                        job["ptz_pending"] = None
+
+            if target is None:
+                time.sleep(PTZ_WORKER_POLL_SECONDS)
+                continue
+
+            with state_lock:
+                job = ingest_jobs.get(job_id)
+                if not job:
+                    return
+                hot_enabled = bool(job.get("ptz_hot_update_enabled", False))
+                command_endpoint = str(job.get("ptz_command_endpoint", "") or "")
+
+            if hot_enabled and command_endpoint:
+                applied, error = _apply_ptz_hot_update(command_endpoint, target)
+                if applied:
+                    with state_lock:
+                        job = ingest_jobs.get(job_id)
+                        if not job:
+                            return
+                        if job.get("state") != "running":
+                            job["ptz_worker_running"] = False
+                            return
+                        job["ptz"] = dict(target)
+                        job["last_ptz_apply_ts"] = time.monotonic()
+                        job["ptz_hot_failures"] = 0
+                        job["last_error"] = None
+                        job["updated_at"] = datetime.utcnow().isoformat()
+                    continue
+
+                with state_lock:
+                    job = ingest_jobs.get(job_id)
+                    if not job:
+                        return
+                    job["ptz_hot_failures"] = int(job.get("ptz_hot_failures", 0)) + 1
+                    job["updated_at"] = datetime.utcnow().isoformat()
+
+            applied, error = _restart_ingest_with_ptz(job_id, target)
+            if not applied:
+                with state_lock:
+                    job = ingest_jobs.get(job_id)
+                    if not job:
+                        return
+                    if job.get("state") != "running":
+                        job["ptz_worker_running"] = False
+                        return
+                    # Keep latest target queued for next attempt.
+                    job["ptz_pending"] = target
+                    if error:
+                        job["last_error"] = f"ptz apply deferred: {error}"
+                    job["updated_at"] = datetime.utcnow().isoformat()
+                time.sleep(max(PTZ_WORKER_POLL_SECONDS, 0.25))
+
+    t = threading.Thread(target=_worker, daemon=True)
     t.start()
 
 
@@ -441,7 +674,14 @@ def ingest_start(req: IngestStartRequest, authorization: str | None = Header(def
     _auth(authorization)
     job_id = str(uuid4())
     ptz_state = {"center_x": 0.5, "center_y": 0.5, "zoom": 1.0}
-    cmd = _ffmpeg_ingest_cmd(req.source_uri_ref, req.profile, ptz=ptz_state)
+    hot_ptz = PTZ_HOT_UPDATE_ENABLED and zmq is not None
+    ptz_command_endpoint = _allocate_local_tcp_endpoint() if hot_ptz else None
+    cmd = _ffmpeg_ingest_cmd(
+        req.source_uri_ref,
+        req.profile,
+        ptz=ptz_state,
+        ptz_command_endpoint=ptz_command_endpoint,
+    )
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except OSError:
@@ -462,11 +702,18 @@ def ingest_start(req: IngestStartRequest, authorization: str | None = Header(def
             "source_uri_ref": req.source_uri_ref,
             "ptz": ptz_state,
             "last_ptz_apply_ts": time.monotonic(),
+            "ptz_pending": None,
+            "ptz_worker_running": True,
+            "ptz_restart_count": 0,
+            "ptz_hot_update_enabled": hot_ptz,
+            "ptz_command_endpoint": ptz_command_endpoint,
+            "ptz_hot_failures": 0,
             "tracking": _init_tracking_state(req.profile),
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
         }
     _start_ingest_watcher(job_id, proc)
+    _start_ptz_worker(job_id)
     return {"job_id": job_id, "state": "running"}
 
 
@@ -482,6 +729,9 @@ def ingest_stop(req: IngestStopRequest, authorization: str | None = Header(defau
     _kill_process(proc)
     with state_lock:
         job["state"] = "stopped"
+        job["ptz_pending"] = None
+        job["ptz_worker_running"] = False
+        job["ptz_command_endpoint"] = None
         job["updated_at"] = datetime.utcnow().isoformat()
     return {"state": "stopped"}
 
@@ -527,6 +777,12 @@ def tracking_update(req: TrackingUpdateRequest, authorization: str | None = Head
                 "fallback_active": req.fallback_active,
                 "occlusion_level": round(req.occlusion_level, 4),
                 "source": req.source.strip().lower(),
+                "tracking_mode_hint": req.tracking_mode_hint,
+                "play_phase": req.play_phase,
+                "ball_velocity_x": req.ball_velocity_x,
+                "ball_velocity_y": req.ball_velocity_y,
+                "possession_side": req.possession_side,
+                "court_homography_ok": req.court_homography_ok,
                 "updated_at": datetime.utcnow().isoformat(),
             }
         )
@@ -561,6 +817,12 @@ def tracking_status(req: TrackingStatusRequest, authorization: str | None = Head
             "fallback_active": bool(tracking.get("fallback_active", True)),
             "occlusion_level": float(tracking.get("occlusion_level", 1.0)),
             "source": str(tracking.get("source", "runner")),
+            "tracking_mode_hint": tracking.get("tracking_mode_hint"),
+            "play_phase": tracking.get("play_phase"),
+            "ball_velocity_x": tracking.get("ball_velocity_x"),
+            "ball_velocity_y": tracking.get("ball_velocity_y"),
+            "possession_side": tracking.get("possession_side"),
+            "court_homography_ok": tracking.get("court_homography_ok"),
             "available": True,
             "updated_at": tracking.get("updated_at"),
         }
@@ -569,19 +831,12 @@ def tracking_status(req: TrackingStatusRequest, authorization: str | None = Head
 @app.post("/runner/ptz/update")
 def ptz_update(req: PtzUpdateRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
-    now = time.monotonic()
     with state_lock:
         job = ingest_jobs.get(req.job_id)
         if not job:
             raise HTTPException(status_code=404, detail="ptz job not found")
         if job.get("state") != "running":
             raise HTTPException(status_code=409, detail="ptz update requires a running ingest job")
-
-        old_proc = job.get("proc")
-        source_uri_ref = str(job.get("source_uri_ref", "")).strip()
-        profile = str(job.get("profile", "balanced"))
-        if not source_uri_ref:
-            raise HTTPException(status_code=500, detail="ingest job missing source_uri_ref")
 
         ptz_state = {
             "center_x": round(_clamp(req.center_x, 0.0, 1.0), 4),
@@ -596,9 +851,7 @@ def ptz_update(req: PtzUpdateRequest, authorization: str | None = Header(default
         delta_y = abs(ptz_state["center_y"] - prev_y)
         delta_zoom = abs(ptz_state["zoom"] - prev_zoom)
         is_tiny_delta = delta_x < PTZ_MIN_DELTA_XY and delta_y < PTZ_MIN_DELTA_XY and delta_zoom < PTZ_MIN_DELTA_ZOOM
-        last_applied_ts = float(job.get("last_ptz_apply_ts", 0.0))
-        in_cooldown = (now - last_applied_ts) < PTZ_MIN_APPLY_INTERVAL_SECONDS
-        if is_tiny_delta or in_cooldown:
+        if is_tiny_delta:
             return {
                 "job_id": req.job_id,
                 "state": "running",
@@ -608,23 +861,23 @@ def ptz_update(req: PtzUpdateRequest, authorization: str | None = Header(default
                     "zoom": round(prev_zoom, 4),
                 },
                 "applied": False,
-                "reason": "tiny_delta" if is_tiny_delta else "cooldown",
+                "queued": False,
+                "reason": "tiny_delta",
             }
-        cmd = _ffmpeg_ingest_cmd(source_uri_ref, profile, ptz=ptz_state)
-        try:
-            new_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        except OSError:
-            raise HTTPException(status_code=500, detail="failed to restart ffmpeg for ptz update") from None
-
-        job["proc"] = new_proc
-        job["pid"] = new_proc.pid
-        job["ptz"] = ptz_state
-        job["last_ptz_apply_ts"] = now
+        job["ptz_pending"] = ptz_state
         job["updated_at"] = datetime.utcnow().isoformat()
-
-    _kill_process(old_proc)
-    _start_ingest_watcher(req.job_id, new_proc)
-    return {"job_id": req.job_id, "state": "running", "ptz": ptz_state, "applied": True}
+        last_applied_ts = float(job.get("last_ptz_apply_ts", 0.0))
+        in_cooldown = (time.monotonic() - last_applied_ts) < PTZ_RESTART_MIN_INTERVAL_SECONDS
+        queue_depth = 1 if isinstance(job.get("ptz_pending"), dict) else 0
+        return {
+            "job_id": req.job_id,
+            "state": "running",
+            "ptz": ptz_state,
+            "applied": False,
+            "queued": True,
+            "queue_depth": queue_depth,
+            "reason": "queued_cooldown" if in_cooldown else "queued_worker",
+        }
 
 
 @app.on_event("shutdown")
