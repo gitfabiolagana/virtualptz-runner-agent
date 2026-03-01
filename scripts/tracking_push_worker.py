@@ -44,6 +44,35 @@ def _simulated_payload(job_id: str, tick: int, source: str) -> dict:
     wave = math.sin((tick % 120) / 120.0 * math.tau)
     conf = _clamp(0.62 + (0.22 * wave) + random.uniform(-0.05, 0.05), 0.0, 1.0)
     occ = _clamp(0.45 - conf + random.uniform(-0.08, 0.08), 0.0, 1.0)
+    scan_amp_x = 0.08 + (0.22 * (1.0 - conf)) + (0.18 * occ)
+    scan_amp_y = 0.04 + (0.14 * (1.0 - conf)) + (0.12 * occ)
+    target_x = _clamp(0.5 + (scan_amp_x * math.sin((tick % 240) / 240.0 * math.tau)), 0.0, 1.0)
+    target_y = _clamp(0.5 + (scan_amp_y * math.sin(((tick + 47) % 300) / 300.0 * math.tau)), 0.0, 1.0)
+    target_zoom = _clamp(1.05 + (1.25 * conf) - (0.4 * occ), 1.0, 4.0)
+    targets: list[dict[str, object]] = []
+    for idx in range(10):
+        base_phase = ((tick + (idx * 13)) % 360) / 360.0 * math.tau
+        px = _clamp(0.5 + (0.34 * math.sin(base_phase + (idx * 0.19))), 0.0, 1.0)
+        py = _clamp(0.52 + (0.16 * math.sin((base_phase * 0.83) + (idx * 0.11))), 0.0, 1.0)
+        pconf = _clamp(conf + random.uniform(-0.20, 0.15), 0.2, 0.99)
+        targets.append(
+            {
+                "x": round(px, 4),
+                "y": round(py, 4),
+                "confidence": round(pconf, 4),
+                "cls": "player",
+            }
+        )
+    ball_x = _clamp(target_x + random.uniform(-0.07, 0.07), 0.0, 1.0)
+    ball_y = _clamp(target_y + random.uniform(-0.05, 0.05), 0.0, 1.0)
+    targets.append(
+        {
+            "x": round(ball_x, 4),
+            "y": round(ball_y, 4),
+            "confidence": round(_clamp(conf + 0.12, 0.35, 1.0), 4),
+            "cls": "ball",
+        }
+    )
     return {
         "job_id": job_id,
         "tracking_confidence": round(conf, 4),
@@ -51,6 +80,10 @@ def _simulated_payload(job_id: str, tick: int, source: str) -> dict:
         "fallback_active": conf < 0.42,
         "occlusion_level": round(occ, 4),
         "source": source,
+        "target_x": round(target_x, 4),
+        "target_y": round(target_y, 4),
+        "target_zoom": round(target_zoom, 4),
+        "targets": targets,
     }
 
 
@@ -60,6 +93,27 @@ def _file_payload(job_id: str, file_path: Path, source: str) -> dict:
     fallback = bool(raw.get("fallback_active", conf < 0.42))
     state = str(raw.get("tracking_state", _state_from_confidence(conf))).strip().lower()
     occ = float(raw.get("occlusion_level", 0.0))
+    raw_targets = raw.get("targets")
+    targets: list[dict[str, object]] = []
+    if isinstance(raw_targets, list):
+        for item in raw_targets:
+            if not isinstance(item, dict):
+                continue
+            try:
+                tx = _clamp(float(item.get("x")), 0.0, 1.0)
+                ty = _clamp(float(item.get("y")), 0.0, 1.0)
+            except (TypeError, ValueError):
+                continue
+            tconf = _clamp(float(item.get("confidence", conf)), 0.0, 1.0)
+            targets.append(
+                {
+                    "x": round(tx, 4),
+                    "y": round(ty, 4),
+                    "confidence": round(tconf, 4),
+                    "cls": str(item.get("cls", "player"))[:32],
+                }
+            )
+
     return {
         "job_id": job_id,
         "tracking_confidence": round(_clamp(conf, 0.0, 1.0), 4),
@@ -67,6 +121,28 @@ def _file_payload(job_id: str, file_path: Path, source: str) -> dict:
         "fallback_active": fallback,
         "occlusion_level": round(_clamp(occ, 0.0, 1.0), 4),
         "source": str(raw.get("source", source)).strip().lower(),
+        "target_x": (
+            round(_clamp(float(raw["target_x"]), 0.0, 1.0), 4)
+            if raw.get("target_x") is not None
+            else None
+        ),
+        "target_y": (
+            round(_clamp(float(raw["target_y"]), 0.0, 1.0), 4)
+            if raw.get("target_y") is not None
+            else None
+        ),
+        "target_zoom": (
+            round(_clamp(float(raw["target_zoom"]), 1.0, 4.0), 4)
+            if raw.get("target_zoom") is not None
+            else None
+        ),
+        "tracking_mode_hint": raw.get("tracking_mode_hint"),
+        "play_phase": raw.get("play_phase"),
+        "ball_velocity_x": raw.get("ball_velocity_x"),
+        "ball_velocity_y": raw.get("ball_velocity_y"),
+        "possession_side": raw.get("possession_side"),
+        "court_homography_ok": raw.get("court_homography_ok"),
+        "targets": targets or None,
     }
 
 
