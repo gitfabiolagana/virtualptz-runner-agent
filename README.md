@@ -25,6 +25,15 @@ RUNNER_API_KEY=tokenA RUNNER_PUBLIC_BASE_URL=http://10.0.1.10:9001 uvicorn app.m
 - `RUNNER_PTZ_RESTART_MIN_INTERVAL_SECONDS` (default `1.15`) fallback restart throttled quando hot-update fallisce
 - `RUNNER_PTZ_WORKER_POLL_SECONDS` (default `0.08`) polling worker PTZ
 
+WebRTC preview configuration
+- `RUNNER_WEBRTC_ENABLED` (0/1) abilita il flusso WebRTC preview (default 0)
+- `RUNNER_WEBRTC_PUBLISH_BASE_URI` base URI per la destinazione di publish (es. RTSP o RTMP). If this
+  value starts with `rtmp://` the runner will publish using FLV (`-f flv`) so media servers like SRS can
+  ingest via RTMP. If it is an RTSP URI the runner will publish via RTSP.
+- `RUNNER_WEBRTC_WHEP_BASE_URL` base URL used to build the runner preview endpoint. For some media servers
+  (e.g. SRS) a WHIP-style `whip-play` endpoint expects query parameters; the runner will build a compatible
+  preview URL when `whip-play` appears in this value.
+
 ## Stato attuale
 
 L'agent avvia processi FFmpeg reali per preview e ingest, espone stato job e stop con terminate/kill.

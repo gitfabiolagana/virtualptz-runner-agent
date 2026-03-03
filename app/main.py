@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import logging
 import math
 import random
 import time
@@ -85,6 +86,13 @@ class PtzUpdateRequest(BaseModel):
     zoom: float = Field(default=1.0, ge=1.0, le=4.0)
 
 
+class PreviewPtzUpdateRequest(BaseModel):
+    job_id: str
+    center_x: float = Field(default=0.5, ge=0.0, le=1.0)
+    center_y: float = Field(default=0.5, ge=0.0, le=1.0)
+    zoom: float = Field(default=1.0, ge=1.0, le=4.0)
+
+
 app = FastAPI(title="VirtualPTZ Runner Agent", version="0.2.0")
 RUNNER_API_KEY = os.getenv("RUNNER_API_KEY", "").strip()
 RUNNER_PUBLIC_BASE_URL = os.getenv("RUNNER_PUBLIC_BASE_URL", "http://127.0.0.1:9001").rstrip("/")
@@ -93,6 +101,11 @@ PREVIEW_DEFAULT_FPS = max(1, min(60, int(os.getenv("PREVIEW_MJPEG_FPS", "20"))))
 PREVIEW_DEFAULT_SCALE = os.getenv("PREVIEW_MJPEG_SCALE", "640:-1").strip() or "640:-1"
 PREVIEW_DEFAULT_QV = max(2, min(31, int(os.getenv("PREVIEW_MJPEG_Q", "8"))))
 PREVIEW_LOW_LATENCY = os.getenv("PREVIEW_MJPEG_LOW_LATENCY", "1").strip() not in {"0", "false", "False"}
+RUNNER_WEBRTC_ENABLED = os.getenv("RUNNER_WEBRTC_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+RUNNER_WEBRTC_PUBLISH_BASE_URI = os.getenv("RUNNER_WEBRTC_PUBLISH_BASE_URI", "").strip().rstrip("/")
+RUNNER_WEBRTC_WHEP_BASE_URL = os.getenv("RUNNER_WEBRTC_WHEP_BASE_URL", "").strip().rstrip("/")
+RUNNER_WEBRTC_PUBLISH_PROFILE = os.getenv("RUNNER_WEBRTC_PUBLISH_PROFILE", "balanced").strip().lower()
+RUNNER_WEBRTC_KEYINT = max(15, min(120, int(os.getenv("RUNNER_WEBRTC_KEYINT", "30"))))
 PTZ_MIN_APPLY_INTERVAL_SECONDS = max(0.1, float(os.getenv("RUNNER_PTZ_MIN_APPLY_INTERVAL_SECONDS", "0.25")))
 PTZ_MIN_DELTA_XY = max(0.0, float(os.getenv("RUNNER_PTZ_MIN_DELTA_XY", "0.004")))
 PTZ_MIN_DELTA_ZOOM = max(0.0, float(os.getenv("RUNNER_PTZ_MIN_DELTA_ZOOM", "0.010")))
@@ -145,6 +158,46 @@ def _kill_process(proc: subprocess.Popen | None, timeout: float = 2.0) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=1)
+
+
+def _spawn_ffmpeg_with_log_capture(cmd: list[str], job_id: str) -> subprocess.Popen:
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except OSError:
+        raise HTTPException(status_code=500, detail="failed to start ffmpeg process") from None
+
+    def _capture_ffmpeg_stderr(p: subprocess.Popen, jid: str) -> None:
+        logger = logging.getLogger("runner.ffmpeg")
+        try:
+            if p.stderr is None:
+                return
+            for line in iter(p.stderr.readline, b""):
+                if not line:
+                    break
+                text = None
+                try:
+                    text = line.decode(errors="ignore").rstrip()
+                except Exception:
+                    text = None
+                try:
+                    if text:
+                        logger.info("[job %s] %s", jid, text)
+                        print(f"[ffmpeg {jid}] {text}")
+                except Exception:
+                    try:
+                        if text:
+                            print(f"[ffmpeg {jid}] {text}")
+                    except Exception:
+                        pass
+        finally:
+            try:
+                p.stderr.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_capture_ffmpeg_stderr, args=(proc, job_id), daemon=True)
+    t.start()
+    return proc
 
 
 def _ffprobe_cmd(source_uri: str) -> list[str]:
@@ -203,6 +256,87 @@ def _ffmpeg_preview_cmd(
     if _is_file_like_source(source_uri) and start_seconds > 0.001:
         cmd.extend(["-ss", f"{start_seconds:.3f}"])
     cmd.extend(["-i", source_uri, "-an", "-vf", vf, "-q:v", str(q_v), "-flush_packets", "1", "-f", "mjpeg", "pipe:1"])
+    return cmd
+
+
+def _webrtc_publish_preset(profile: str) -> list[str]:
+    table = {
+        "quality": ["-preset", "slow", "-crf", "20"],
+        "balanced": ["-preset", "veryfast", "-crf", "24"],
+        "fluid": ["-preset", "ultrafast", "-crf", "28"],
+    }
+    return table.get(profile, table["balanced"])
+
+
+def _ffmpeg_webrtc_publish_cmd(
+    source_uri: str,
+    publish_uri: str,
+    ptz: dict | None = None,
+    start_seconds: float = 0.0,
+) -> list[str]:
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    if PREVIEW_LOW_LATENCY:
+        cmd.extend(["-fflags", "nobuffer", "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32768"])
+    if _is_file_like_source(source_uri):
+        cmd.extend(["-re"])
+    if source_uri.startswith("rtsp://"):
+        cmd.extend(["-rtsp_transport", "tcp"])
+    elif source_uri.startswith("rtmp://"):
+        cmd.extend(["-rw_timeout", "15000000"])
+
+    # Reduce resolution to lower encoder work and NALU fragmentation under MTU.
+    vf = "scale=960:540"
+    if isinstance(ptz, dict):
+        zoom = _clamp(float(ptz.get("zoom", 1.0)), 1.0, 4.0)
+        cx = _clamp(float(ptz.get("center_x", 0.5)), 0.0, 1.0)
+        cy = _clamp(float(ptz.get("center_y", 0.5)), 0.0, 1.0)
+        if zoom > 1.01:
+            vf = (
+                f"crop=w=iw/{zoom:.4f}:h=ih/{zoom:.4f}:x=(iw-iw/{zoom:.4f})*{cx:.4f}:"
+                f"y=(ih-ih/{zoom:.4f})*{cy:.4f},scale=1280:720"
+            )
+
+    if _is_file_like_source(source_uri) and start_seconds > 0.001:
+        cmd.extend(["-ss", f"{start_seconds:.3f}"])
+
+    # Choose output format based on publish_uri scheme. Default to RTSP if scheme unknown.
+    scheme = ""
+    try:
+        scheme = publish_uri.split(":", 1)[0].lower()
+    except Exception:
+        scheme = ""
+
+    output_args: list[str] = []
+    if scheme == "rtmp":
+        # Publish to RTMP (FLV) if publish_uri is an rtmp:// URL
+        output_args = ["-f", "flv", publish_uri]
+    else:
+        # Default: RTSP publish
+        output_args = ["-f", "rtsp", "-x264-params", "slice-max-size=600:slices=1", "-profile:v", "baseline", "-b:v", "1500k", "-maxrate", "2000k", "-bufsize", "4000k", "-rtsp_transport", "tcp", publish_uri]
+
+    cmd.extend(
+        [
+            "-i",
+            source_uri,
+            "-an",
+            "-vf",
+            vf,
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-tune",
+            "zerolatency",
+            "-g",
+            str(RUNNER_WEBRTC_KEYINT),
+            "-keyint_min",
+            str(RUNNER_WEBRTC_KEYINT),
+            "-sc_threshold",
+            "0",
+            *(_webrtc_publish_preset(RUNNER_WEBRTC_PUBLISH_PROFILE)),
+            *output_args,
+        ]
+    )
     return cmd
 
 
@@ -576,6 +710,60 @@ def probe(req: ProbeRequest, authorization: str | None = Header(default=None)) -
 def preview_start(req: PreviewStartRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     job_id = str(uuid4())
+    transport = "mjpeg"
+    if isinstance(req.profile, dict):
+        transport = str(req.profile.get("transport", "mjpeg")).strip().lower() or "mjpeg"
+
+    if transport == "webrtc":
+        if not RUNNER_WEBRTC_ENABLED:
+            raise HTTPException(status_code=409, detail="runner webrtc preview disabled")
+        if not RUNNER_WEBRTC_PUBLISH_BASE_URI or not RUNNER_WEBRTC_WHEP_BASE_URL:
+            raise HTTPException(status_code=409, detail="runner webrtc endpoints not configured")
+
+        publish_uri = f"{RUNNER_WEBRTC_PUBLISH_BASE_URI.rstrip('/')}/{job_id}"
+        # Some media servers (like SRS used in PoC) expose a WHIP/whip-play endpoint
+        # which expects query parameters instead of a path. If the configured WHEP base
+        # URL includes 'whip-play' we build the preview_url accordingly so the gateway
+        # and frontend can POST raw SDP to it.
+        if RUNNER_WEBRTC_WHEP_BASE_URL and ("whip-play" in RUNNER_WEBRTC_WHEP_BASE_URL):
+            preview_url = f"{RUNNER_WEBRTC_WHEP_BASE_URL}?app=live&stream={job_id}"
+        else:
+            preview_url = f"{RUNNER_WEBRTC_WHEP_BASE_URL.rstrip('/')}/{job_id}/whep"
+        ptz = req.profile.get("ptz") if isinstance(req.profile, dict) else None
+        start_seconds = 0.0
+        if isinstance(req.profile, dict):
+            try:
+                start_seconds = max(0.0, float(req.profile.get("start_seconds", 0.0)))
+            except (TypeError, ValueError):
+                start_seconds = 0.0
+
+        cmd = _ffmpeg_webrtc_publish_cmd(
+            req.source_uri_ref,
+            publish_uri=publish_uri,
+            ptz=ptz,
+            start_seconds=start_seconds,
+        )
+        proc = _spawn_ffmpeg_with_log_capture(cmd, job_id)
+
+        with state_lock:
+            preview_jobs[job_id] = {
+                "job_id": job_id,
+                "source_uri_ref": req.source_uri_ref,
+                "command": cmd,
+                "proc": proc,
+                "mode": "webrtc",
+                "preview_url": preview_url,
+                "publish_uri": publish_uri,
+                "ptz": ptz or {"center_x": 0.5, "center_y": 0.5, "zoom": 1.0},
+                "start_seconds": start_seconds,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+        return {
+            "job_id": job_id,
+            "preview_kind": "webrtc",
+            "preview_url": preview_url,
+        }
+
     fps = int(req.profile.get("fps", PREVIEW_DEFAULT_FPS)) if isinstance(req.profile, dict) else PREVIEW_DEFAULT_FPS
     scale = str(req.profile.get("scale", PREVIEW_DEFAULT_SCALE)) if isinstance(req.profile, dict) else PREVIEW_DEFAULT_SCALE
     q_v = int(req.profile.get("q_v", req.profile.get("q", PREVIEW_DEFAULT_QV))) if isinstance(req.profile, dict) else PREVIEW_DEFAULT_QV
@@ -602,9 +790,61 @@ def preview_start(req: PreviewStartRequest, authorization: str | None = Header(d
             "job_id": job_id,
             "source_uri_ref": req.source_uri_ref,
             "command": cmd,
+            "mode": "mjpeg",
+            "profile": {"fps": fps, "scale": scale, "q_v": q_v},
+            "ptz": ptz or {"center_x": 0.5, "center_y": 0.5, "zoom": 1.0},
+            "start_seconds": start_seconds,
             "created_at": datetime.utcnow().isoformat(),
         }
-    return {"job_id": job_id, "preview_url": f"{RUNNER_PUBLIC_BASE_URL}/runner/preview/stream/{job_id}"}
+    return {
+        "job_id": job_id,
+        "preview_kind": "mjpeg",
+        "preview_url": f"{RUNNER_PUBLIC_BASE_URL}/runner/preview/stream/{job_id}",
+    }
+
+
+@app.post("/runner/preview/check")
+def preview_check(req: dict, authorization: str | None = Header(default=None)) -> dict:
+    """Check whether a previously-started webrtc preview job is actually publishing to the media server.
+
+    Expects JSON: { "job_id": "..." }
+    Returns: { "available": true|false }
+    """
+    _auth(authorization)
+    job_id = str(req.get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id required")
+    with state_lock:
+        job = preview_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="preview job not found")
+
+    publish_uri = str(job.get("publish_uri", "") or "").strip()
+    if not publish_uri:
+        return {"available": False}
+
+    # Use ffprobe to check whether publish URI is serving streams yet.
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ]
+    if publish_uri.startswith("rtsp://"):
+        cmd.extend(["-rtsp_transport", "tcp"])
+    elif publish_uri.startswith("rtmp://"):
+        cmd.extend(["-rw_timeout", "2000000"])
+    cmd.append(publish_uri)
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2.0, text=True, check=False)
+    except subprocess.TimeoutExpired:
+        return {"available": False}
+
+    ok = proc.returncode == 0 and bool((proc.stdout or "").strip())
+    return {"available": bool(ok)}
 
 
 @app.get("/runner/preview/stream/{job_id}")
@@ -614,6 +854,8 @@ def preview_stream(job_id: str, authorization: str | None = Header(default=None)
         job = preview_jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="preview job not found")
+    if str(job.get("mode", "mjpeg")) != "mjpeg":
+        raise HTTPException(status_code=409, detail="preview stream endpoint supports only mjpeg jobs")
 
     cmd = list(job["command"])
 
@@ -665,7 +907,9 @@ def preview_stream(job_id: str, authorization: str | None = Header(default=None)
 def preview_stop(req: PreviewStopRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     with state_lock:
-        preview_jobs.pop(req.job_id, None)
+        job = preview_jobs.pop(req.job_id, None)
+    if isinstance(job, dict) and str(job.get("mode", "")) == "webrtc":
+        _kill_process(job.get("proc"))
     return {"stopped": True}
 
 
@@ -880,9 +1124,84 @@ def ptz_update(req: PtzUpdateRequest, authorization: str | None = Header(default
         }
 
 
+@app.post("/runner/preview/ptz/update")
+def preview_ptz_update(req: PreviewPtzUpdateRequest, authorization: str | None = Header(default=None)) -> dict:
+    _auth(authorization)
+    ptz_state = {
+        "center_x": round(_clamp(req.center_x, 0.0, 1.0), 4),
+        "center_y": round(_clamp(req.center_y, 0.0, 1.0), 4),
+        "zoom": round(_clamp(req.zoom, 1.0, 4.0), 4),
+    }
+    with state_lock:
+        job = preview_jobs.get(req.job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="preview job not found")
+        mode = str(job.get("mode", "mjpeg")).strip().lower()
+
+        if mode == "mjpeg":
+            source_uri_ref = str(job.get("source_uri_ref", "")).strip()
+            profile = job.get("profile") or {}
+            fps = int(profile.get("fps", PREVIEW_DEFAULT_FPS))
+            scale = str(profile.get("scale", PREVIEW_DEFAULT_SCALE))
+            q_v = int(profile.get("q_v", PREVIEW_DEFAULT_QV))
+            start_seconds = float(job.get("start_seconds", 0.0) or 0.0)
+            job["command"] = _ffmpeg_preview_cmd(
+                source_uri_ref,
+                fps=fps,
+                scale=scale,
+                q_v=q_v,
+                ptz=ptz_state,
+                start_seconds=start_seconds,
+            )
+            job["ptz"] = ptz_state
+            job["updated_at"] = datetime.utcnow().isoformat()
+            return {
+                "job_id": req.job_id,
+                "preview_kind": "mjpeg",
+                "state": "running",
+                "ptz": ptz_state,
+                "applied": True,
+                "method": "command-refresh",
+            }
+
+        if mode == "webrtc":
+            source_uri_ref = str(job.get("source_uri_ref", "")).strip()
+            publish_uri = str(job.get("publish_uri", "")).strip()
+            start_seconds = float(job.get("start_seconds", 0.0) or 0.0)
+            if not source_uri_ref or not publish_uri:
+                raise HTTPException(status_code=500, detail="preview job missing source/publish uri")
+            cmd = _ffmpeg_webrtc_publish_cmd(
+                source_uri_ref,
+                publish_uri=publish_uri,
+                ptz=ptz_state,
+                start_seconds=start_seconds,
+            )
+            old_proc = job.get("proc")
+            proc = _spawn_ffmpeg_with_log_capture(cmd, req.job_id)
+            job["proc"] = proc
+            job["command"] = cmd
+            job["ptz"] = ptz_state
+            job["updated_at"] = datetime.utcnow().isoformat()
+        else:
+            raise HTTPException(status_code=409, detail=f"unsupported preview mode: {mode}")
+
+    _kill_process(old_proc)
+    return {
+        "job_id": req.job_id,
+        "preview_kind": "webrtc",
+        "state": "running",
+        "ptz": ptz_state,
+        "applied": True,
+        "method": "process-restart",
+    }
+
+
 @app.on_event("shutdown")
 def shutdown_cleanup() -> None:
     with state_lock:
         jobs = list(ingest_jobs.values())
+        previews = list(preview_jobs.values())
     for job in jobs:
         _kill_process(job.get("proc"))
+    for preview in previews:
+        _kill_process(preview.get("proc"))

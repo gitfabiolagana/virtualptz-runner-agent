@@ -41,14 +41,26 @@ def _post_tracking_update(base_url: str, api_key: str, payload: dict) -> dict:
 
 
 def _simulated_payload(job_id: str, tick: int, source: str) -> dict:
+    phase_x = (tick % 240) / 240.0 * math.tau
+    phase_y = ((tick + 47) % 300) / 300.0 * math.tau
+    prev_phase_x = ((tick - 1) % 240) / 240.0 * math.tau
+    prev_phase_y = (((tick - 1) + 47) % 300) / 300.0 * math.tau
     wave = math.sin((tick % 120) / 120.0 * math.tau)
     conf = _clamp(0.62 + (0.22 * wave) + random.uniform(-0.05, 0.05), 0.0, 1.0)
     occ = _clamp(0.45 - conf + random.uniform(-0.08, 0.08), 0.0, 1.0)
     scan_amp_x = 0.08 + (0.22 * (1.0 - conf)) + (0.18 * occ)
     scan_amp_y = 0.04 + (0.14 * (1.0 - conf)) + (0.12 * occ)
-    target_x = _clamp(0.5 + (scan_amp_x * math.sin((tick % 240) / 240.0 * math.tau)), 0.0, 1.0)
-    target_y = _clamp(0.5 + (scan_amp_y * math.sin(((tick + 47) % 300) / 300.0 * math.tau)), 0.0, 1.0)
+    target_x = _clamp(0.5 + (scan_amp_x * math.sin(phase_x)), 0.0, 1.0)
+    target_y = _clamp(0.5 + (scan_amp_y * math.sin(phase_y)), 0.0, 1.0)
+    prev_target_x = _clamp(0.5 + (scan_amp_x * math.sin(prev_phase_x)), 0.0, 1.0)
+    prev_target_y = _clamp(0.5 + (scan_amp_y * math.sin(prev_phase_y)), 0.0, 1.0)
     target_zoom = _clamp(1.05 + (1.25 * conf) - (0.4 * occ), 1.0, 4.0)
+    ball_velocity_x = _clamp(target_x - prev_target_x, -1.0, 1.0)
+    ball_velocity_y = _clamp(target_y - prev_target_y, -1.0, 1.0)
+    speed = abs(ball_velocity_x) + (0.65 * abs(ball_velocity_y))
+    play_phase = "transition" if speed >= 0.09 else "set_offense"
+    tracking_mode_hint = "fast_break" if speed >= 0.12 else "follow_play"
+    possession_side = "left" if target_x < 0.48 else "right" if target_x > 0.52 else "unknown"
     targets: list[dict[str, object]] = []
     for idx in range(10):
         base_phase = ((tick + (idx * 13)) % 360) / 360.0 * math.tau
@@ -80,6 +92,12 @@ def _simulated_payload(job_id: str, tick: int, source: str) -> dict:
         "fallback_active": conf < 0.42,
         "occlusion_level": round(occ, 4),
         "source": source,
+        "tracking_mode_hint": tracking_mode_hint,
+        "play_phase": play_phase,
+        "ball_velocity_x": round(ball_velocity_x, 4),
+        "ball_velocity_y": round(ball_velocity_y, 4),
+        "possession_side": possession_side,
+        "court_homography_ok": False,
         "target_x": round(target_x, 4),
         "target_y": round(target_y, 4),
         "target_zoom": round(target_zoom, 4),
