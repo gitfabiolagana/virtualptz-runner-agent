@@ -93,7 +93,22 @@ class PreviewPtzUpdateRequest(BaseModel):
     zoom: float = Field(default=1.0, ge=1.0, le=4.0)
 
 
-app = FastAPI(title="VirtualPTZ Runner Agent", version="0.2.0")
+app = FastAPI(
+    title="VirtualPTZ Runner Agent",
+    version="0.2.0",
+    summary="Runner execution agent for VirtualPTZ media workloads.",
+    description=(
+        "Executes ffmpeg-based preview/ingest jobs and applies tracking/PTZ updates "
+        "as requested by the MCP gateway."
+    ),
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    openapi_tags=[
+        {"name": "health", "description": "Runner service health."},
+        {"name": "runner", "description": "Runner video job lifecycle and status APIs."},
+    ],
+)
 RUNNER_API_KEY = os.getenv("RUNNER_API_KEY", "").strip()
 RUNNER_PUBLIC_BASE_URL = os.getenv("RUNNER_PUBLIC_BASE_URL", "http://127.0.0.1:9001").rstrip("/")
 INGEST_OUTPUT_URI = os.getenv("RUNNER_INGEST_OUTPUT_URI", "").strip()
@@ -673,7 +688,7 @@ def _start_ptz_worker(job_id: str) -> None:
     t.start()
 
 
-@app.get("/health")
+@app.get("/health", tags=["health"], summary="Runner Health Check")
 def health() -> dict:
     with state_lock:
         return {
@@ -683,7 +698,7 @@ def health() -> dict:
         }
 
 
-@app.post("/runner/probe")
+@app.post("/runner/probe", tags=["runner"], summary="Probe Source")
 def probe(req: ProbeRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     cmd = _ffprobe_cmd(req.source_uri_ref)
@@ -706,7 +721,7 @@ def probe(req: ProbeRequest, authorization: str | None = Header(default=None)) -
     return {"ok": True, "details": details}
 
 
-@app.post("/runner/preview/start")
+@app.post("/runner/preview/start", tags=["runner"], summary="Start Preview Job")
 def preview_start(req: PreviewStartRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     job_id = str(uuid4())
@@ -803,7 +818,7 @@ def preview_start(req: PreviewStartRequest, authorization: str | None = Header(d
     }
 
 
-@app.post("/runner/preview/check")
+@app.post("/runner/preview/check", tags=["runner"], summary="Check Preview Availability")
 def preview_check(req: dict, authorization: str | None = Header(default=None)) -> dict:
     """Check whether a previously-started webrtc preview job is actually publishing to the media server.
 
@@ -847,7 +862,7 @@ def preview_check(req: dict, authorization: str | None = Header(default=None)) -
     return {"available": bool(ok)}
 
 
-@app.get("/runner/preview/stream/{job_id}")
+@app.get("/runner/preview/stream/{job_id}", tags=["runner"], summary="Preview Stream")
 def preview_stream(job_id: str, authorization: str | None = Header(default=None)) -> StreamingResponse:
     _auth(authorization)
     with state_lock:
@@ -903,7 +918,7 @@ def preview_stream(job_id: str, authorization: str | None = Header(default=None)
     )
 
 
-@app.post("/runner/preview/stop")
+@app.post("/runner/preview/stop", tags=["runner"], summary="Stop Preview Job")
 def preview_stop(req: PreviewStopRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     with state_lock:
@@ -913,7 +928,7 @@ def preview_stop(req: PreviewStopRequest, authorization: str | None = Header(def
     return {"stopped": True}
 
 
-@app.post("/runner/ingest/start")
+@app.post("/runner/ingest/start", tags=["runner"], summary="Start Ingest Job")
 def ingest_start(req: IngestStartRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     job_id = str(uuid4())
@@ -961,7 +976,7 @@ def ingest_start(req: IngestStartRequest, authorization: str | None = Header(def
     return {"job_id": job_id, "state": "running"}
 
 
-@app.post("/runner/ingest/stop")
+@app.post("/runner/ingest/stop", tags=["runner"], summary="Stop Ingest Job")
 def ingest_stop(req: IngestStopRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     with state_lock:
@@ -980,7 +995,7 @@ def ingest_stop(req: IngestStopRequest, authorization: str | None = Header(defau
     return {"state": "stopped"}
 
 
-@app.post("/runner/job/status")
+@app.post("/runner/job/status", tags=["runner"], summary="Job Status")
 def status(req: JobStatusRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     with state_lock:
@@ -1006,7 +1021,7 @@ def status(req: JobStatusRequest, authorization: str | None = Header(default=Non
         }
 
 
-@app.post("/runner/tracking/update")
+@app.post("/runner/tracking/update", tags=["runner"], summary="Tracking Update")
 def tracking_update(req: TrackingUpdateRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     with state_lock:
@@ -1035,7 +1050,7 @@ def tracking_update(req: TrackingUpdateRequest, authorization: str | None = Head
         return {"job_id": req.job_id, **tracking}
 
 
-@app.post("/runner/tracking/status")
+@app.post("/runner/tracking/status", tags=["runner"], summary="Tracking Status")
 def tracking_status(req: TrackingStatusRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     with state_lock:
@@ -1072,7 +1087,7 @@ def tracking_status(req: TrackingStatusRequest, authorization: str | None = Head
         }
 
 
-@app.post("/runner/ptz/update")
+@app.post("/runner/ptz/update", tags=["runner"], summary="PTZ Update")
 def ptz_update(req: PtzUpdateRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     with state_lock:
@@ -1124,7 +1139,7 @@ def ptz_update(req: PtzUpdateRequest, authorization: str | None = Header(default
         }
 
 
-@app.post("/runner/preview/ptz/update")
+@app.post("/runner/preview/ptz/update", tags=["runner"], summary="Preview PTZ Update")
 def preview_ptz_update(req: PreviewPtzUpdateRequest, authorization: str | None = Header(default=None)) -> dict:
     _auth(authorization)
     ptz_state = {

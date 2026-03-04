@@ -12,6 +12,12 @@ pip install -e .
 RUNNER_API_KEY=tokenA RUNNER_PUBLIC_BASE_URL=http://10.0.1.10:9001 uvicorn app.main:app --host 0.0.0.0 --port 9001
 ```
 
+Swagger/OpenAPI:
+
+- Swagger UI: `http://127.0.0.1:9001/docs`
+- ReDoc: `http://127.0.0.1:9001/redoc`
+- OpenAPI JSON: `http://127.0.0.1:9001/openapi.json`
+
 ## Config utili
 
 - `RUNNER_API_KEY` token richiesto dal gateway
